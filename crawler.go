@@ -1,3 +1,4 @@
+// Package main implements a concurrent web crawler with SQLite storage
 package main
 
 import (
@@ -15,13 +16,19 @@ import (
 	"golang.org/x/net/html"
 )
 
-// Store handles persistence with in-memory cache
+// Store handles the persistence of crawled pages and their relationships.
+// It maintains thread-safe operations using a mutex and provides an in-memory
+// cache of visited URLs for performance optimization.
 type Store struct {
-	db      *sql.DB
-	mu      sync.RWMutex
-	visited map[string]bool // In-memory cache
+	db      *sql.DB          // SQLite database connection
+	mu      sync.RWMutex     // Mutex for thread-safe operations
+	visited map[string]bool   // In-memory cache of visited URLs
 }
 
+// loadVisited loads all previously visited URLs from the database into memory.
+// This method rebuilds the in-memory cache during initialization to ensure
+// consistency with the persistent storage.
+// Returns an error if the database query fails.
 func (s *Store) loadVisited() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -55,6 +62,13 @@ func (s *Store) loadVisited() error {
 	return nil
 }
 
+// NewStore creates a new Store instance with the specified SQLite database file.
+// It initializes the database schema if it doesn't exist and loads visited URLs into memory.
+// Parameters:
+//   - dbFile: Path to the SQLite database file
+// Returns:
+//   - *Store: A new Store instance
+//   - error: Any error that occurred during initialization
 func NewStore(dbFile string) (*Store, error) {
 	db, err := sql.Open("sqlite3", dbFile)
 	if err != nil {
@@ -110,12 +124,28 @@ func NewStore(dbFile string) (*Store, error) {
 	return store, nil
 }
 
+// IsVisited checks if a URL has been already crawled by checking the in-memory cache.
+// This method is thread-safe.
+// Parameters:
+//   - url: The URL to check
+// Returns:
+//   - bool: true if the URL has been visited, false otherwise
 func (s *Store) IsVisited(url string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.visited[url]
 }
 
+// AddSite stores a crawled page and its outgoing links in the database.
+// It updates both the persistent storage and the in-memory cache atomically
+// using database transactions for data consistency.
+// Parameters:
+//   - url: The URL of the crawled page
+//   - title: The page title
+//   - content: The page content
+//   - links: Slice of outgoing links found on the page
+// Returns:
+//   - error: Any error that occurred during storage
 func (s *Store) AddSite(url, title, content string, links []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -162,19 +192,23 @@ func (s *Store) AddSite(url, title, content string, links []string) error {
 	return tx.Commit()
 }
 
+// Close closes the database connection.
 func (s *Store) Close() {
 	s.db.Close()
 }
 
-// Crawler structure
+// Crawler represents the web crawler component that manages the crawling process.
+// It coordinates the crawling of web pages, content extraction, and storage
+// while maintaining concurrent operations.
 type Crawler struct {
-	store      *Store
-	httpClient *http.Client
+	store      *Store        // Database and cache store
+	httpClient *http.Client  // Configured HTTP client for web requests
 }
 
+// task represents a URL to be crawled along with its depth in the crawling tree.
 type task struct {
-	url   string
-	depth int
+	url   string  // URL to be crawled
+	depth int     // Remaining depth for crawling
 }
 
 func NewCrawler(store *Store) *Crawler {
@@ -191,6 +225,12 @@ func NewCrawler(store *Store) *Crawler {
 	}
 }
 
+// fetchURL retrieves the HTML content of a given URL using the configured HTTP client.
+// Parameters:
+//   - targetURL: The URL to fetch
+// Returns:
+//   - *html.Node: Parsed HTML document
+//   - error: Any error that occurred during fetching
 func (c *Crawler) fetchURL(targetURL string) (*html.Node, error) {
 	resp, err := c.httpClient.Get(targetURL)
 	if err != nil {
@@ -205,6 +245,12 @@ func (c *Crawler) fetchURL(targetURL string) (*html.Node, error) {
 	return html.Parse(resp.Body)
 }
 
+// extractContent extracts the title and main content from an HTML document.
+// Parameters:
+//   - doc: Parsed HTML document
+// Returns:
+//   - string: Page title
+//   - string: Page content
 func (c *Crawler) extractContent(doc *html.Node) (string, string) {
 	var title, content string
 	var f func(*html.Node)
@@ -233,6 +279,13 @@ func (c *Crawler) extractContent(doc *html.Node) (string, string) {
 	return title, strings.Join(strings.Fields(content), " ")
 }
 
+// extractLinks extracts all valid HTTP(S) links from an HTML document.
+// It resolves relative URLs against the base URL and removes duplicates.
+// Parameters:
+//   - doc: Parsed HTML document
+//   - base: Base URL for resolving relative links
+// Returns:
+//   - []string: Slice of unique, absolute URLs
 func (c *Crawler) extractLinks(doc *html.Node, base *url.URL) []string {
 	 var links []string
     linkSet := make(map[string]struct{})
@@ -272,6 +325,11 @@ func (c *Crawler) extractLinks(doc *html.Node, base *url.URL) []string {
     return links
 }
 
+// crawl starts the crawling process from a given URL up to a maximum depth.
+// It uses a concurrent worker pool to process URLs in parallel.
+// Parameters:
+//   - startURL: The URL to start crawling from
+//   - maxDepth: Maximum depth to crawl
 func (c *Crawler) crawl(startURL string, maxDepth int) {
 	var wg sync.WaitGroup
 	workQueue := make(chan task, 10000) // Buffer más grande
@@ -305,6 +363,13 @@ func (c *Crawler) crawl(startURL string, maxDepth int) {
 	wg.Wait()
 }
 
+// processURL processes a single URL by fetching its content, extracting information,
+// and storing it in the database. It also schedules newly discovered URLs for crawling.
+// Parameters:
+//   - currentURL: URL to process
+//   - depth: Current crawling depth
+//   - queue: Channel for scheduling new URLs
+//   - wg: WaitGroup for synchronization
 func (c *Crawler) processURL(currentURL string, depth int, queue chan<- task, wg *sync.WaitGroup) {
 	defer wg.Done()
 
@@ -357,6 +422,13 @@ func (c *Crawler) processURL(currentURL string, depth int, queue chan<- task, wg
 	// log.Printf("Procesamiento completado para: %s", currentURL)
 }
 
+// fetchURLWithContext fetches a URL with context support for timeout control.
+// Parameters:
+//   - ctx: Context for timeout control
+//   - url: URL to fetch
+// Returns:
+//   - *html.Node: Parsed HTML document
+//   - error: Any error that occurred during fetching
 func (c *Crawler) fetchURLWithContext(ctx context.Context, url string) (*html.Node, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -376,7 +448,15 @@ func (c *Crawler) fetchURLWithContext(ctx context.Context, url string) (*html.No
 	return html.Parse(resp.Body)
 }
 
-// 4. Añadir método AddSiteBatch al Store
+// AddSiteBatch adds a site and its links to the database in a single transaction.
+// This method provides better performance for batch operations.
+// Parameters:
+//   - url: The URL of the crawled page
+//   - title: The page title
+//   - content: The page content
+//   - links: Slice of outgoing links
+// Returns:
+//   - error: Any error that occurred during storage
 func (s *Store) AddSiteBatch(url, title, content string, links []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
