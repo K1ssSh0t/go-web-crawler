@@ -234,39 +234,42 @@ func (c *Crawler) extractContent(doc *html.Node) (string, string) {
 }
 
 func (c *Crawler) extractLinks(doc *html.Node, base *url.URL) []string {
-	var links []string
-	linkSet := make(map[string]struct{})
+	 var links []string
+    linkSet := make(map[string]struct{})
 
-	var f func(*html.Node)
-	f = func(n *html.Node) {
-		if n.Type == html.ElementNode && n.Data == "a" {
-			for _, attr := range n.Attr {
-				if attr.Key == "href" {
-					link, err := url.Parse(attr.Val)
-					if err != nil {
-						continue
-					}
-					resolved := base.ResolveReference(link).String()
-					// Filter out non-HTTP and fragments
-					if strings.HasPrefix(resolved, "http") &&
-						!strings.Contains(resolved, "#") {
-						linkSet[resolved] = struct{}{}
-					}
-				}
-			}
-		}
+    log.Printf("Extrayendo enlaces de la página: %s", base.String())
+
+    var f func(*html.Node)
+    f = func(n *html.Node) {
+        if n.Type == html.ElementNode && n.Data == "a" {
+            for _, attr := range n.Attr {
+                if attr.Key == "href" {
+                    link, err := url.Parse(attr.Val)
+                    if err != nil {
+                        log.Printf("Error al parsear URL: %s - %v", attr.Val, err)
+                        continue
+                    }
+                    resolved := base.ResolveReference(link).String()
+                    if strings.HasPrefix(resolved, "http") && !strings.Contains(resolved, "#") {
+                        log.Printf("Encontrado enlace válido: %s", resolved)
+                        linkSet[resolved] = struct{}{}
+                    }
+                }
+            }
+        }
 		for child := n.FirstChild; child != nil; child = child.NextSibling {
 			f(child)
 		}
 	}
 
-	f(doc)
+	 f(doc)
 
-	// Convert set to slice
-	for link := range linkSet {
-		links = append(links, link)
-	}
-	return links
+    for link := range linkSet {
+        links = append(links, link)
+    }
+
+    log.Printf("Extraídos %d enlaces únicos", len(links))
+    return links
 }
 
 func (c *Crawler) crawl(startURL string, maxDepth int) {
@@ -305,14 +308,20 @@ func (c *Crawler) crawl(startURL string, maxDepth int) {
 func (c *Crawler) processURL(currentURL string, depth int, queue chan<- task, wg *sync.WaitGroup) {
 	defer wg.Done()
 
+	// log.Printf("Procesando URL: %s (profundidad: %d)", currentURL, depth)
+
 	if depth <= 0 {
+		// log.Printf("Profundidad alcanzada, omitiendo: %s", currentURL)
 		return
 	}
 
 	// Verificar si ya fue visitado (con bloqueo de lectura)
 	if c.store.IsVisited(currentURL) {
+		log.Printf("URL ya visitada, omitiendo: %s", currentURL)
 		return
 	}
+
+	// log.Printf("Iniciando procesamiento de: %s", currentURL)
 
 	// Procesamiento más rápido con timeout controlado
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -320,26 +329,32 @@ func (c *Crawler) processURL(currentURL string, depth int, queue chan<- task, wg
 
 	doc, err := c.fetchURLWithContext(ctx, currentURL)
 	if err != nil {
-		log.Printf("Fetch error: %s - %v", currentURL, err)
+		log.Printf("Error al obtener URL %s: %v", currentURL, err)
 		return
 	}
 
 	base, _ := url.Parse(currentURL)
 	title, content := c.extractContent(doc)
-	links := c.extractLinks(doc, base)
+	link := c.extractLinks(doc, base)
+
+	log.Printf("Extraídos %d enlaces de: %s", len(link), currentURL)
 
 	// Procesamiento en batch para mejor performance
-	if err := c.store.AddSiteBatch(currentURL, title, content, links); err != nil {
-		log.Printf("DB error: %v", err)
+	if err := c.store.AddSiteBatch(currentURL, title, content, link); err != nil {
+		log.Printf("Error al guardar en base de datos para %s: %v", currentURL, err)
 	}
 
-	// Agregar links al queue en batch
-	for _, link := range links {
+	// Agregar link al queue en batch
+	for _, link := range link {
+		// log.Printf("Encontrado enlace: %s", link)
 		if !c.store.IsVisited(link) {
 			wg.Add(1)
 			queue <- task{url: link, depth: depth - 1}
+			// log.Printf("Encolando nuevo enlace: %s (profundidad: %d)", link, depth-1)
 		}
 	}
+
+	// log.Printf("Procesamiento completado para: %s", currentURL)
 }
 
 func (c *Crawler) fetchURLWithContext(ctx context.Context, url string) (*html.Node, error) {
@@ -410,6 +425,6 @@ func main() {
 
 	crawler := NewCrawler(store)
 	start := time.Now()
-	crawler.crawl("https://example.com", 5)
+	crawler.crawl("https://example.com", 2)
 	fmt.Printf("Crawled in %s\n", time.Since(start))
 }
